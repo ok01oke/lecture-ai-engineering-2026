@@ -56,6 +56,7 @@ def test_chat_loop_exits_on_terminal_interrupt(monkeypatch, end):
     monkeypatch.setattr(ask.genai, "Client", Mock(return_value=client))
     monkeypatch.setattr(ask, "get_api_key", lambda: "test-key")
     monkeypatch.setattr(ask, "ask", Mock(return_value="回答"))
+    monkeypatch.setattr(ask, "compact_chat", lambda client, chat, summary, question: (chat, summary))
 
     def interrupted_input(_):
         raise end
@@ -63,3 +64,83 @@ def test_chat_loop_exits_on_terminal_interrupt(monkeypatch, end):
     monkeypatch.setattr("builtins.input", interrupted_input)
     ask.chat_loop("質問")
     client.__exit__.assert_called_once()
+
+
+def make_history(turns):
+    return [
+        types.Content(role=role, parts=[types.Part(text=f"{turn}:{role}")])
+        for turn in range(turns)
+        for role in ("user", "model")
+    ]
+
+
+def summary_response(text, finish_reason="STOP"):
+    return types.GenerateContentResponse(candidates=[types.Candidate(
+        content=types.Content(role="model", parts=[types.Part(text=text)]),
+        finish_reason=finish_reason,
+    )])
+
+
+@pytest.mark.parametrize("turns,tokens", [(3, 10000), (4, 4000)])
+def test_compact_chat_keeps_history_when_not_needed(turns, tokens):
+    client = Mock()
+    client.models.count_tokens.return_value = types.CountTokensResponse(total_tokens=tokens)
+    chat = Chat(modules=Mock(), model=ask.MODEL, config=None, history=make_history(turns))
+
+    result, summary = ask.compact_chat(client, chat, "", "次の質問")
+
+    assert result is chat
+    assert summary == ""
+    client.models.generate_content.assert_not_called()
+    client.chats.create.assert_not_called()
+
+
+def test_compact_chat_replaces_old_history_and_merges_previous_summary():
+    client = Mock()
+    client.models.count_tokens.return_value = types.CountTokensResponse(total_tokens=5000)
+    client.models.generate_content.side_effect = [
+        summary_response("最初の要約"), summary_response("統合した要約")
+    ]
+    modules = Mock()
+    client.chats.create.side_effect = lambda **kwargs: Chat(modules=modules, **kwargs)
+    history = make_history(5)
+    chat = Chat(modules=modules, model=ask.MODEL, config=None, history=history)
+
+    new_chat, summary = ask.compact_chat(client, chat, "", "今回の質問")
+
+    assert new_chat.get_history() == history[-6:]
+    assert chat.get_history() == history  # 元の履歴は成功するまで変更しない
+    assert summary == "最初の要約"
+    first_prompt = client.models.generate_content.call_args.kwargs["contents"]
+    assert "0:user" in first_prompt and "1:model" in first_prompt
+    assert "2:user" not in first_prompt  # 直近3往復を要約に巻き込まない
+    count_contents = client.models.count_tokens.call_args.kwargs["contents"]
+    assert count_contents[-1].parts[0].text == "今回の質問"
+    config = client.chats.create.call_args.kwargs["config"]
+    assert "最初の要約" in config.system_instruction
+
+    # 次の往復の後で再圧縮し、前回の要約も統合する。
+    next_history = [*new_chat.get_history(), *make_history(1)]
+    continued_chat = Chat(modules=modules, model=ask.MODEL, config=config, history=next_history)
+    final_chat, summary = ask.compact_chat(client, continued_chat, summary, "さらに質問")
+
+    assert summary == "統合した要約"
+    assert final_chat.get_history() == next_history[-6:]
+    assert "最初の要約" in client.models.generate_content.call_args.kwargs["contents"]
+    counted_summary = client.models.count_tokens.call_args.kwargs["contents"][0]
+    assert "最初の要約" in counted_summary.parts[0].text
+    assert "統合した要約" in client.chats.create.call_args.kwargs["config"].system_instruction
+
+
+@pytest.mark.parametrize("text,reason", [("", "STOP"), ("途中の要約", "MAX_TOKENS")])
+def test_compact_chat_preserves_history_on_failed_summary(text, reason):
+    client = Mock()
+    client.models.count_tokens.return_value = types.CountTokensResponse(total_tokens=5000)
+    client.models.generate_content.return_value = summary_response(text, reason)
+    chat = Chat(modules=Mock(), model=ask.MODEL, config=None, history=make_history(4))
+
+    result, summary = ask.compact_chat(client, chat, "前回の要約", "質問")
+
+    assert result is chat
+    assert summary == "前回の要約"
+    client.chats.create.assert_not_called()
